@@ -1,0 +1,31 @@
+{
+  "name": "mldetect",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "In-browser object detection & tracking: speed, direction and predicted path for every object in a video.",
+  "scripts": {
+    "fetch-model": "node scripts/fetch-model.mjs",
+    "predev": "node scripts/fetch-model.mjs",
+    "prebuild": "node scripts/fetch-model.mjs",
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc -b --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "onnxruntime-web": "^1.30.0",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.3",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.1.1",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.2",
+    "vitest": "^5.0.3"
+  }
+}
