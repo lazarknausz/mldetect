@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 24 24%27%3E%3Ccircle cx=%2712%27 cy=%2712%27 r=%278%27 fill=%27none%27 stroke=%27%234f8cff%27 stroke-width=%272%27/%3E%3Cpath d=%27M12 2v6M12 16v6M2 12h6M16 12h6%27 stroke=%27%234f8cff%27 stroke-width=%272%27/%3E%3C/svg%3E" />
+    <title>MLDetect — Speed Gun</title>
+    <script type="module" crossorigin src="/mldetect/assets/speedGun-Lwk0yb_M.js"></script>
+    <link rel="modulepreload" crossorigin href="/mldetect/assets/transforms-DUUGBbMG.js">
+    <link rel="stylesheet" crossorigin href="/mldetect/assets/speedGun-BdRtikz2.css">
+  </head>
+  <body>
+    <div class="gun-app">
+      <header class="gun-header">
+        <div class="brand">
+          <svg viewBox="0 0 24 24" width="26" height="26" aria-hidden="true">
+            <circle cx="12" cy="12" r="8" fill="none" stroke="currentColor" stroke-width="2" />
+            <path d="M12 2v6M12 16v6M2 12h6M16 12h6" stroke="currentColor" stroke-width="2" />
+          </svg>
+          <h1>Speed Gun</h1>
+        </div>
+        <p>Calibrated speed measurement: distance over time, like a LIDAR gun, from a video.</p>
+        <a class="nav-link" href="./">← Object tracker</a>
+      </header>
+
+      <main class="gun-main">
+        <section class="gun-stage">
+          <!-- The video element only decodes frames; everything is drawn on the canvas. -->
+          <video id="video" muted playsinline preload="auto" hidden></video>
+          <div class="canvas-wrap" id="canvasWrap">
+            <canvas id="view" width="1280" height="720"></canvas>
+            <div class="canvas-message" id="canvasMessage">
+              <p><b>Step 1.</b> Choose a video (.mp4 or .webm) on the right.</p>
+            </div>
+          </div>
+
+          <div class="gun-transport">
+            <button id="firstFrame" class="icon" title="First frame" disabled>⏮</button>
+            <button id="prevFrame" class="icon" title="Previous frame" disabled>◀</button>
+            <button id="nextFrame" class="icon" title="Next frame" disabled>▶</button>
+            <input id="scrub" type="range" min="0" max="0" step="1" value="0" disabled aria-label="Frame" />
+            <span id="frameLabel" class="mono">frame – / –</span>
+          </div>
+
+          <!-- Persistent read-outs required by the spec. -->
+          <div class="readouts">
+            <div class="readout big">
+              <span class="label">Current speed</span>
+              <span class="value" id="currentSpeed">–</span>
+              <span class="unit">km/h</span>
+            </div>
+            <div class="readout big">
+              <span class="label">Max speed detected</span>
+              <span class="value" id="maxSpeed">–</span>
+              <span class="unit">km/h</span>
+            </div>
+            <div class="readout">
+              <span class="label">Calibration</span>
+              <span class="value small" id="ratioLabel">–</span>
+            </div>
+            <div class="readout">
+              <span class="label">Video</span>
+              <span class="value small" id="fpsLabel">–</span>
+            </div>
+          </div>
+          <div id="results" class="results"></div>
+        </section>
+
+        <aside class="gun-panel">
+          <div class="status-row"><span id="modelDot" class="dot loading"></span><span id="modelStatus">Loading detector…</span></div>
+
+          <h3>1 · Video</h3>
+          <label class="file-btn">
+            <input id="fileInput" type="file" accept="video/mp4,video/webm,video/*" />
+            <span>Choose video…</span>
+          </label>
+          <p class="hint" id="fileName">Nothing loaded. The video stays on your device.</p>
+
+          <h3>2 · Calibrate</h3>
+          <p class="hint">
+            On the frame, <b>click and drag a line along something whose real length you know</b>, then type
+            that length. Drag the ends to adjust. Zoom the page in for precision: every pixel of error at
+            the ends is error in the speed.
+          </p>
+          <ul class="hint tips">
+            <li>
+              <b>Road:</b> draw <i>along</i> the lane, from the start of one dash to the start of the next
+              (US highways: 12.19 m). Choose a stretch where cars are fully in the picture as they cross it,
+              not at the frame's edge.
+            </li>
+            <li>
+              <b>Vehicle:</b> step to a frame where it moves <i>across</i> the view, then draw nose to tail.
+              Measuring starts from that frame.
+            </li>
+          </ul>
+          <label class="field">
+            <span>How long is this line in real life (in meters)?</span>
+            <input id="metresInput" type="number" min="0.1" step="0.01" placeholder="e.g. 12.19" disabled />
+          </label>
+          <label class="field">
+            <span>Common lengths</span>
+            <select id="presetSelect" disabled>
+              <option value="">Choose…</option>
+              <option value="12.19">US highway lane marking: dash + gap (12.19 m)</option>
+              <option value="3.05">US highway lane dash (3.05 m)</option>
+              <option value="9.14">US highway gap between dashes (9.14 m)</option>
+              <option value="18">EU motorway marking: dash + gap (18 m)</option>
+              <option value="3.66">US lane width (3.66 m)</option>
+              <option value="3.5">EU motorway lane width (3.5 m)</option>
+              <option value="4.5">Average car length (4.5 m)</option>
+              <option value="39.5">Boeing 737-800 length (39.5 m)</option>
+              <option value="37.6">Airbus A320 length (37.6 m)</option>
+              <option value="33.6">Boeing 737-700 length (33.6 m)</option>
+            </select>
+          </label>
+          <fieldset class="field modes" id="modeField" disabled>
+            <legend>What did you measure?</legend>
+            <label>
+              <input type="radio" name="mode" value="ground" checked />
+              <span><b>Something on the road</b> (lane markings…). Vehicles are measured as they cross that stretch, like a speed camera. For fixed cameras.</span>
+            </label>
+            <label>
+              <input type="radio" name="mode" value="object" />
+              <span><b>The vehicle itself</b> (car / plane length). That vehicle is followed, and the scale follows its size, even if the camera pans or zooms.</span>
+            </label>
+          </fieldset>
+          <button id="clearLine" class="ghost" disabled>Redraw line</button>
+
+          <h3>3 · Measure</h3>
+          <label class="field">
+            <span>Detector</span>
+            <select id="modelSelect">
+              <option value="tiny">Fast · YOLOX-Tiny</option>
+              <option value="small">Accurate · YOLOX-S (finds smaller vehicles)</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>Frame rate (auto-detected)</span>
+            <input id="fpsInput" type="number" min="1" max="240" step="0.001" disabled />
+          </label>
+          <div class="row">
+            <button id="startBtn" class="primary" disabled>Start measuring</button>
+            <button id="stopBtn" disabled>Stop</button>
+          </div>
+          <div class="progress" id="progressBar"><div></div></div>
+          <p class="hint small" id="perfLabel"></p>
+
+          <details class="explain">
+            <summary>How it works</summary>
+            <p>
+              <b>Time:</b> each frame is exactly 1 / FPS seconds after the previous one, so the gun steps through
+              the video frame by frame.
+            </p>
+            <p>
+              <b>Distance:</b> the vehicle's pixel displacement × the calibration ratio (metres per pixel). The
+              displacement comes from sub-pixel optical flow on the vehicle itself. Camera pans are subtracted.
+            </p>
+            <p>
+              <b>Speed = distance / time</b>, averaged with a least-squares fit over the last 0.5 s, because a
+              single frame's pixel noise would swing the reading by ±10 km/h. A vehicle that crosses the whole
+              road calibration line gets the exact trap reading: line length ÷ crossing time.
+            </p>
+            <p>
+              A calibration line is only exact at its own distance from the camera. That's why road
+              calibrations measure vehicles in that stretch, and vehicle calibrations carry the line along on the
+              vehicle, so its scale follows the vehicle as it comes closer, turns or the camera zooms.
+            </p>
+            <p>
+              <b>Limits:</b> one camera only sees motion <i>across</i> the picture. A vehicle driving straight
+              at the camera barely moves on screen, so its speed can't be measured then. The reading is held
+              while the vehicle is partly out of the frame.
+            </p>
+          </details>
+        </aside>
+      </main>
+    </div>
+  </body>
+</html>
