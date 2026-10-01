@@ -1,10 +1,11 @@
-import { CLASS_PRESETS } from '../detection/classes';
+import { AIRCRAFT_SIZES, CLASS_ID, CLASS_PRESETS } from '../detection/classes';
 import type { DetectorClient } from '../detection/detectorClient';
-import { letterboxRatio } from '../detection/preprocess';
+import { MOTION_IMAGE_SIZE } from '../detection/protocol';
+import { planRegions, regionRatio } from '../detection/tiling';
 import { computeView, hitTest, renderOverlay } from '../render/overlay';
 import type { Settings } from '../settings';
 import { Tracker } from '../tracking/tracker';
-import type { TrackSnapshot } from '../tracking/types';
+import type { CameraState, TrackSnapshot } from '../tracking/types';
 
 export type EngineMode = 'live' | 'analyzing' | 'replay';
 
@@ -18,6 +19,9 @@ export interface EngineStats {
   fps: number;
   inferMs: number;
   totalObjects: number;
+  /** Detector passes per frame (full frame + tiles). */
+  passes: number;
+  camera: CameraState;
 }
 
 export interface EngineCallbacks {
@@ -46,7 +50,9 @@ export class TrackingEngine {
   private rafHandle = 0;
   private rvfcHandle = 0;
   private selectedId: number | null = null;
-  private stats: EngineStats = { fps: 0, inferMs: 0, totalObjects: 0 };
+  private stats: EngineStats = { fps: 0, inferMs: 0, totalObjects: 0, passes: 1, camera: 'static' };
+  /** Changes whenever tracking restarts, so camera motion is not measured across a jump. */
+  private sequence = 0;
   private processedTimes: number[] = [];
   private lastEmitted: FrameResult | null = null;
 
@@ -78,7 +84,7 @@ export class TrackingEngine {
     this.settings = next;
     this.applyTrackerSettings();
     this.video.playbackRate = next.playbackRate;
-    if (prev.preset !== next.preset && this.mode === 'live') this.resetTracking();
+    if ((prev.preset !== next.preset || prev.tiling !== next.tiling) && this.mode === 'live') this.resetTracking();
   }
 
   select(id: number | null): void {
@@ -97,7 +103,7 @@ export class TrackingEngine {
   }
 
   resetTracking(): void {
-    this.tracker.reset();
+    this.restartTracker();
     this.latest = { t: this.video.currentTime, tracks: [] };
     this.processedTimes = [];
     this.emit(this.latest);
@@ -120,7 +126,7 @@ export class TrackingEngine {
     this.cancelAnalysis = false;
     // Wait for any in-flight live detection to finish.
     while (this.busy) await sleep(10);
-    this.tracker.reset();
+    this.restartTracker();
     this.frames = [];
     const step = 1 / this.settings.analysisFps;
     const duration = video.duration;
@@ -151,7 +157,15 @@ export class TrackingEngine {
   // ---------------------------------------------------------------- internals
 
   private applyTrackerSettings() {
-    this.tracker.opts.highThreshold = this.settings.confidence;
+    const { opts } = this.tracker;
+    opts.highThreshold = this.settings.confidence;
+    opts.zoom = this.settings.zoom;
+    opts.referenceSizes = { [CLASS_ID.airplane]: AIRCRAFT_SIZES[this.settings.aircraft].ref };
+  }
+
+  private restartTracker() {
+    this.tracker.reset();
+    this.sequence++;
   }
 
   private setMode(mode: EngineMode) {
@@ -168,7 +182,7 @@ export class TrackingEngine {
   private onSeeked = () => {
     // A user seek invalidates motion history; start fresh at the new position.
     if (this.mode === 'live') {
-      this.tracker.reset();
+      this.restartTracker();
       this.latest = { t: this.video.currentTime, tracks: [] };
       this.emit(this.latest);
     }
@@ -180,7 +194,7 @@ export class TrackingEngine {
     if (last !== null && Math.abs(t - last) < 1e-4) return;
     this.busy = true;
     try {
-      if (last !== null && (t < last || t - last > 2)) this.tracker.reset();
+      if (last !== null && (t < last || t - last > 2)) this.restartTracker();
       const tracks = await this.detectAndTrack(t);
       if (this.mode !== 'live' || this.disposed) return;
       this.latest = { t, tracks };
@@ -200,22 +214,32 @@ export class TrackingEngine {
     const video = this.video;
     const vw = video.videoWidth;
     const vh = video.videoHeight;
-    const ratio = letterboxRatio(vw, vh, this.detector.model.inputSize);
+    const inputSize = this.detector.model.inputSize;
+    const regions = planRegions(vw, vh, inputSize, this.settings.tiling);
+    // Resize once, to the finest resolution any region (or the motion estimate) needs.
+    const bitmapScale = Math.min(
+      1,
+      Math.max(MOTION_IMAGE_SIZE / Math.max(vw, vh), ...regions.map((r) => regionRatio(r, inputSize))),
+    );
     const bitmap = await createImageBitmap(video, {
-      resizeWidth: Math.max(1, Math.round(vw * ratio)),
-      resizeHeight: Math.max(1, Math.round(vh * ratio)),
+      resizeWidth: Math.max(1, Math.round(vw * bitmapScale)),
+      resizeHeight: Math.max(1, Math.round(vh * bitmapScale)),
       resizeQuality: 'medium',
     });
-    const { detections, inferMs } = await this.detector.detect(bitmap, {
-      ratio,
+    const { detections, inferMs, camera } = await this.detector.detect(bitmap, {
+      bitmapScale,
       imageWidth: vw,
       imageHeight: vh,
+      regions,
       scoreThreshold: LOW_SCORE,
       classes: CLASS_PRESETS[this.settings.preset].classes,
+      motion: { sequence: this.sequence, t },
     });
     this.stats.inferMs = inferMs;
-    const tracks = this.tracker.update(detections, t, vw, vh);
+    this.stats.passes = regions.length;
+    const tracks = this.tracker.update(detections, t, vw, vh, camera);
     this.stats.totalObjects = this.tracker.totalConfirmed;
+    this.stats.camera = this.tracker.cameraState;
     return tracks;
   }
 

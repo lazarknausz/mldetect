@@ -59,9 +59,10 @@ export function TrackTable({ tracks, selectedId, onSelect }: Props) {
         </table>
       )}
       <p className="hint small">
-        Speeds are estimates. The scale comes from each object&apos;s typical size (car ≈ 4.5 m, bus ≈ 12
-        m, airliner ≈ 38 m) and motion towards/away from the camera from how fast it grows or shrinks,
-        assuming a typical camera lens (~75° diagonal). Zoomed footage or unusual vehicles will be off.
+        Speeds are estimates from each object&apos;s typical size (car ≈ 4.5 m, bus ≈ 12 m, airliner ≈ 38
+        m; set the aircraft type and camera zoom under <i>Speed calibration</i>). They are measured
+        relative to the scene, so a panning or zooming camera is compensated as long as some background
+        is visible, and motion towards / away from the camera is included.
       </p>
     </section>
   );

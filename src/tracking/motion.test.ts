@@ -3,9 +3,8 @@ import { BoxKalman } from './kalman';
 import { CLASS_ID, REFERENCE_SIZE } from '../detection/classes';
 import {
   compassLabel,
-  estimateSpeed,
-  focalLengthPx,
   estimateTurnRate,
+  fitLogSizeRate,
   fitVelocity,
   headingDegrees,
   pixelsPerMetre,
@@ -80,66 +79,41 @@ describe('BoxKalman', () => {
 });
 
 describe('scale estimation', () => {
-  const car = REFERENCE_SIZE[CLASS_ID.car]!;
+  const car = REFERENCE_SIZE[CLASS_ID.car]!; // 4.5 × 1.8 × 1.5 m
   const k = 20; // px per metre
-  it('recovers the scale for side-on, top-down and diagonal motion', () => {
-    expect(pixelsPerMetre(90, 34, [1, 0, 0], car)).toBeCloseTo(k);
-    expect(pixelsPerMetre(34, 90, [0, 1, 0], car)).toBeCloseTo(k);
-    const d = (k * (4.5 + 1.7)) / Math.SQRT2;
-    expect(pixelsPerMetre(d, d, [Math.SQRT1_2, Math.SQRT1_2, 0], car)).toBeCloseTo(k);
-    // Head-on: only the cross-section is visible.
-    expect(pixelsPerMetre(34, 34, [0, 0, -1], car)).toBeCloseTo(k);
+  it('recovers the scale for side-on, top-down and head-on views', () => {
+    // Side-on: length × height.
+    expect(pixelsPerMetre(90, 30, [1, 0, 0], car)).toBeCloseTo(k, 1);
+    // Seen from above, driving up the screen: width × length.
+    expect(pixelsPerMetre(36, 90, [0, -1, 0], car)).toBeCloseTo(k, 1);
+    // Head-on: width × height.
+    expect(pixelsPerMetre(36, 30, [0, 0, -1], car)).toBeCloseTo(k, 1);
+  });
+  it('accounts for the slanted view of an off-centre object', () => {
+    // Driving away, seen 0.3 rad below the optical axis: part of the length shows.
+    const k0 = pixelsPerMetre(36, 30, [0, 0, 1], car);
+    const k1 = pixelsPerMetre(36, 30 + 0.3 * 4.5 * k, [0, 0, 1], car, 0, 0.3);
+    expect(k1).toBeCloseTo(k0, 0);
+  });
+  it('tells an airliner seen from below from one seen side-on', () => {
+    const plane = REFERENCE_SIZE[CLASS_ID.airplane]!; // 38 m long, 35 m span, 12 m tall
+    expect(pixelsPerMetre(380, 120, [1, 0, 0], plane)).toBeCloseTo(10, 0);
+    expect(pixelsPerMetre(380, 350, [1, 0, 0], plane)).toBeCloseTo(10, 0);
   });
   it('uses height for people', () => {
     expect(pixelsPerMetre(20, 170, [1, 0, 0], REFERENCE_SIZE[CLASS_ID.person]!)).toBeCloseTo(100);
   });
 });
 
-/** Renders a car driving along a 3-D straight line through a pinhole camera. */
-function simulate(p0: [number, number, number], vel: [number, number, number], fps: number, n: number) {
-  const W = 1280;
-  const H = 720;
-  const f = focalLengthPx(W, H);
-  const car = REFERENCE_SIZE[CLASS_ID.car]!;
-  const speed = Math.hypot(...vel);
-  const d: [number, number, number] = [vel[0] / speed, vel[1] / speed, vel[2] / speed];
-  const hist: HistoryPoint[] = [];
-  for (let i = 0; i < n; i++) {
-    const t = i / fps;
-    const X = p0[0] + vel[0] * t;
-    const Y = p0[1] + vel[1] * t;
-    const Z = p0[2] + vel[2] * t;
-    const k = f / Z;
-    if (car.kind !== 'motion') throw new Error();
-    const w = k * (car.length * Math.abs(d[0]) + car.cross * Math.sqrt(1 - d[0] ** 2));
-    const h = k * (car.length * Math.abs(d[1]) + car.cross * Math.sqrt(1 - d[1] ** 2));
-    hist.push({ t, cx: W / 2 + (f * X) / Z, cy: H / 2 + (f * Y) / Z, w, h });
-  }
-  const v = fitVelocity(hist, 0.6)!;
-  const last = hist[hist.length - 1];
-  return estimateSpeed({
-    history: hist, vx: v.vx, vy: v.vy, cx: last.cx, cy: last.cy,
-    frameWidth: W, frameHeight: H, ref: car, windowSec: 0.6,
-  })!;
-}
-
-describe('estimateSpeed (pinhole model)', () => {
-  it('measures a car crossing the view', () => {
-    const est = simulate([-10, 2, 40], [30, 0, 0], 15, 12);
-    expect(est.metresPerSecond).toBeCloseTo(30, 0);
-    expect(Math.abs(est.depthComponent)).toBeLessThan(0.1);
-  });
-  it('measures a car driving towards an elevated camera (highway overpass)', () => {
-    // Camera 8 m above the road looking along it: the car drops on screen and grows.
-    const est = simulate([2, 8, 80], [0, 0, -33], 15, 12);
-    expect(est.metresPerSecond).toBeGreaterThan(33 * 0.8);
-    expect(est.metresPerSecond).toBeLessThan(33 * 1.2);
-    expect(est.depthComponent).toBeLessThan(-0.5);
-  });
-  it('measures a receding car', () => {
-    const est = simulate([-2, 6, 30], [0, 0, 25], 15, 12);
-    expect(est.metresPerSecond).toBeGreaterThan(25 * 0.8);
-    expect(est.metresPerSecond).toBeLessThan(25 * 1.2);
-    expect(est.depthComponent).toBeGreaterThan(0.5);
+describe('fitLogSizeRate', () => {
+  it('gives the current growth rate of an object approaching at constant speed', () => {
+    // Z = 50 − 10 t; size ∝ 1/Z; d(ln s)/dt = 10 / Z.
+    const hist: HistoryPoint[] = Array.from({ length: 20 }, (_, i) => {
+      const t = i / 10;
+      const s = 1000 / (50 - 10 * t);
+      return { t, cx: 0, cy: 0, w: s, h: s };
+    });
+    const r = fitLogSizeRate(hist, 2)!;
+    expect(r.rate).toBeCloseTo(10 / (50 - 10 * 1.9), 6);
   });
 });

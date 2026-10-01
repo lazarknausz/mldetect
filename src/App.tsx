@@ -12,7 +12,7 @@ import { DEFAULT_SETTINGS, type Settings } from './settings';
 import type { TrackSnapshot } from './tracking/types';
 
 const TABLE_REFRESH_MS = 150;
-const EMPTY_STATS: EngineStats = { fps: 0, inferMs: 0, totalObjects: 0 };
+const EMPTY_STATS: EngineStats = { fps: 0, inferMs: 0, totalObjects: 0, passes: 1, camera: 'static' };
 
 export default function App() {
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -167,7 +167,8 @@ export default function App() {
       </main>
       <footer>
         Detection: {MODELS[settings.model].label.split(' · ')[1]} (Apache-2.0) via ONNX Runtime Web ·
-        Tracking: ByteTrack-style Kalman + IoU association · Runs 100% locally in your browser.
+        Tracking: ByteTrack-style Kalman + IoU association with camera-motion compensation · Runs 100%
+        locally in your browser.
       </footer>
     </div>
   );

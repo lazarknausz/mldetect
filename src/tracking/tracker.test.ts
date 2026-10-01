@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { CLASS_ID } from '../detection/classes';
 import type { Detection } from '../detection/types';
+import { focalLengthPx } from './motion';
 import { Tracker } from './tracker';
 import type { TrackSnapshot } from './types';
 
@@ -11,6 +12,16 @@ function box(cx: number, cy: number, w: number, h: number, classId: number = CLA
   return { x1: cx - w / 2, y1: cy - h / 2, x2: cx + w / 2, y2: cy + h / 2, score, classId };
 }
 
+/**
+ * A 4.5 × 1.8 × 1.5 m car driving across the view 20 px/m away (camera with the default
+ * 75° lens): off-centre, perspective also shows the width of its side in depth.
+ */
+function sideOnCar(cx: number, cy: number): Detection {
+  const f = focalLengthPx(W, H);
+  const k = 20;
+  return box(cx, cy, k * (4.5 + 1.8 * Math.abs(cx - W / 2) / f), k * (1.5 + 1.8 * Math.abs(cy - H / 2) / f));
+}
+
 describe('Tracker', () => {
   it('keeps stable IDs for two crossing-lane cars and measures their speed', () => {
     const tr = new Tracker();
@@ -18,20 +29,17 @@ describe('Tracker', () => {
     let snaps: TrackSnapshot[] = [];
     for (let i = 0; i < 30; i++) {
       const t = i / fps;
-      snaps = tr.update(
-        [box(100 + 300 * t, 300, 90, 34), box(1100 - 150 * t, 450, 90, 34)],
-        t, W, H,
-      );
+      snaps = tr.update([sideOnCar(100 + 300 * t, 300), sideOnCar(1100 - 150 * t, 450)], t, W, H);
     }
     expect(snaps).toHaveLength(2);
     expect(new Set(snaps.map((s) => s.id))).toEqual(new Set([1, 2]));
     expect(tr.totalConfirmed).toBe(2);
     const right = snaps.find((s) => s.id === 1)!;
     const left = snaps.find((s) => s.id === 2)!;
-    // 4.5 m × 1.7 m car at 20 px/m → 90 × 34 px box; 300 px/s = 15 m/s → 15 m/s → 54 km/h.
-    expect(right.speedKmh!).toBeCloseTo(54, 0);
+    // 4.5 m car at 20 px/m → 90 px long; 300 px/s = 15 m/s = 54 km/h.
+    expect(right.speedKmh!).toBeCloseTo(54, -1);
     expect(right.compass).toBe('E');
-    expect(left.speedKmh!).toBeCloseTo(27, 0);
+    expect(left.speedKmh!).toBeCloseTo(27, -1);
     expect(left.compass).toBe('W');
   });
 

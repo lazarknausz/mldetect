@@ -70,8 +70,10 @@ export function renderOverlay(
     const dim = opts.selectedId !== null && !selected ? 0.45 : 1;
     const color = trackColor(s.id, (lost ? 0.6 : 1) * dim);
     const lead = Math.max(0, Math.min(dt, 0.5));
-    const cx = s.cx + s.vx * lead;
-    const cy = s.cy + s.vy * lead;
+    // The box follows the on-screen motion (incl. camera pans); arrows and predicted
+    // paths show the object's own motion through the scene.
+    const cx = s.cx + s.screenVx * lead;
+    const cy = s.cy + s.screenVy * lead;
     const w = Math.max(2, s.w + s.vw * lead);
     const h = Math.max(2, s.h + s.vh * lead);
 

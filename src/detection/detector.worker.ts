@@ -1,14 +1,19 @@
 /// <reference lib="webworker" />
 import * as ort from 'onnxruntime-web/webgpu';
+import { buildPyramid, estimateGlobalMotion, rgbaToGray, type GrayImage } from '../vision/globalMotion';
+import { rescaleH } from '../vision/transforms';
 import { NUM_CLASSES } from './classes';
 import { decodeYolox } from './postprocess';
 import { PAD_VALUE, rgbaToBgrChw } from './preprocess';
-import type { WorkerRequest, WorkerResponse } from './protocol';
-import type { Backend } from './types';
+import { MOTION_IMAGE_SIZE, type DetectResponse, type WorkerRequest, type WorkerResponse } from './protocol';
+import { dropCutAtTileEdge, mergeRegionDetections, regionRatio } from './tiling';
+import type { Backend, Detection } from './types';
 
 declare const self: DedicatedWorkerGlobalScope;
 
 const IOU_THRESHOLD = 0.45;
+/** Frames further apart than this are not compared for camera motion, seconds. */
+const MAX_MOTION_GAP_SEC = 1;
 
 let session: ort.InferenceSession | null = null;
 let inputName = 'images';
@@ -16,6 +21,16 @@ let outputName = 'output';
 let inputSize = 416;
 let ctx: OffscreenCanvasRenderingContext2D;
 let tensorData: Float32Array<ArrayBuffer>;
+let motionCtx: OffscreenCanvasRenderingContext2D | null = null;
+/** Previous frame for camera-motion measurement. */
+let prevFrame: {
+  sequence: number;
+  t: number;
+  pyramid: GrayImage[];
+  /** Grey-image px per source px. */
+  scale: number;
+  detections: Detection[];
+} | null = null;
 
 function post(msg: WorkerResponse) {
   self.postMessage(msg);
@@ -120,27 +135,73 @@ async function init(modelUrl: string, size: number, preferWebGPU: boolean) {
   post({ type: 'ready', backend: 'wasm' });
 }
 
+async function detectRegions(msg: Extract<WorkerRequest, { type: 'detect' }>): Promise<Detection[]> {
+  const bs = msg.bitmapScale;
+  let full: Detection[] = [];
+  const tiles: Detection[] = [];
+  for (let i = 0; i < msg.regions.length; i++) {
+    const r = msg.regions[i];
+    const ratio = regionRatio(r, inputSize);
+    ctx.fillStyle = `rgb(${PAD_VALUE},${PAD_VALUE},${PAD_VALUE})`;
+    ctx.fillRect(0, 0, inputSize, inputSize);
+    ctx.drawImage(msg.bitmap, r.x * bs, r.y * bs, r.w * bs, r.h * bs, 0, 0, r.w * ratio, r.h * ratio);
+    const { data } = ctx.getImageData(0, 0, inputSize, inputSize);
+    rgbaToBgrChw(data, inputSize, tensorData);
+    const output = await runModel();
+    const dets = decodeYolox(output, {
+      inputSize,
+      numClasses: NUM_CLASSES,
+      ratio,
+      offsetX: r.x,
+      offsetY: r.y,
+      imageWidth: msg.imageWidth,
+      imageHeight: msg.imageHeight,
+      scoreThreshold: msg.scoreThreshold,
+      iouThreshold: IOU_THRESHOLD,
+      classFilter: msg.classes ? new Set(msg.classes) : null,
+    });
+    if (i === 0) full = dets;
+    else tiles.push(...dropCutAtTileEdge(dets, r, msg.imageWidth, msg.imageHeight));
+  }
+  return msg.regions.length > 1 ? mergeRegionDetections(full, tiles, IOU_THRESHOLD) : full;
+}
+
+/** Camera motion since the previous frame of the same sequence (see DetectResponse.camera). */
+function measureCamera(msg: Extract<WorkerRequest, { type: 'detect' }>, detections: Detection[]): DetectResponse['camera'] {
+  if (!msg.motion) {
+    prevFrame = null;
+    return undefined;
+  }
+  const scale = Math.min(msg.bitmapScale, MOTION_IMAGE_SIZE / Math.max(msg.imageWidth, msg.imageHeight));
+  const gw = Math.max(1, Math.round(msg.imageWidth * scale));
+  const gh = Math.max(1, Math.round(msg.imageHeight * scale));
+  if (!motionCtx || motionCtx.canvas.width !== gw || motionCtx.canvas.height !== gh) {
+    motionCtx = new OffscreenCanvas(gw, gh).getContext('2d', { willReadFrequently: true })!;
+  }
+  motionCtx.drawImage(msg.bitmap, 0, 0, gw, gh);
+  const pyramid = buildPyramid(rgbaToGray(motionCtx.getImageData(0, 0, gw, gh).data, gw, gh), 4);
+  const prev = prevFrame;
+  prevFrame = { sequence: msg.motion.sequence, t: msg.motion.t, pyramid, scale, detections };
+  const dt = prev ? msg.motion.t - prev.t : 0;
+  if (!prev || prev.sequence !== msg.motion.sequence || prev.scale !== scale || dt <= 0 || dt > MAX_MOTION_GAP_SEC) {
+    return undefined;
+  }
+  // Keep features off everything that may move by itself.
+  const exclude = prev.detections.map((d) => ({ x1: d.x1 * scale, y1: d.y1 * scale, x2: d.x2 * scale, y2: d.y2 * scale }));
+  const m = estimateGlobalMotion(prev.pyramid, pyramid, exclude);
+  return m ? rescaleH(m.transform, 1 / scale) : null;
+}
+
 async function detect(msg: Extract<WorkerRequest, { type: 'detect' }>) {
   if (!session) throw new Error('Model not loaded');
   const t0 = performance.now();
-  ctx.fillStyle = `rgb(${PAD_VALUE},${PAD_VALUE},${PAD_VALUE})`;
-  ctx.fillRect(0, 0, inputSize, inputSize);
-  ctx.drawImage(msg.bitmap, 0, 0);
-  msg.bitmap.close();
-  const { data } = ctx.getImageData(0, 0, inputSize, inputSize);
-  rgbaToBgrChw(data, inputSize, tensorData);
-  const output = await runModel();
-  const detections = decodeYolox(output, {
-    inputSize,
-    numClasses: NUM_CLASSES,
-    ratio: msg.ratio,
-    imageWidth: msg.imageWidth,
-    imageHeight: msg.imageHeight,
-    scoreThreshold: msg.scoreThreshold,
-    iouThreshold: IOU_THRESHOLD,
-    classFilter: msg.classes ? new Set(msg.classes) : null,
-  });
-  post({ type: 'result', id: msg.id, detections, inferMs: performance.now() - t0 });
+  try {
+    const detections = await detectRegions(msg);
+    const camera = measureCamera(msg, detections);
+    post({ type: 'result', id: msg.id, detections, inferMs: performance.now() - t0, camera });
+  } finally {
+    msg.bitmap.close();
+  }
 }
 
 self.onmessage = (e: MessageEvent<WorkerRequest>) => {
@@ -150,9 +211,6 @@ self.onmessage = (e: MessageEvent<WorkerRequest>) => {
       post({ type: 'error', message: `Failed to load model: ${String(err?.message ?? err)}` }),
     );
   } else if (msg.type === 'detect') {
-    detect(msg).catch((err) => {
-      msg.bitmap.close();
-      post({ type: 'error', id: msg.id, message: String(err?.message ?? err) });
-    });
+    detect(msg).catch((err) => post({ type: 'error', id: msg.id, message: String(err?.message ?? err) }));
   }
 };

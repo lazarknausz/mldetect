@@ -36,6 +36,9 @@ export interface DecodeOptions {
   numClasses: number;
   /** Letterbox scale (model px = source px × ratio). */
   ratio: number;
+  /** Top-left of the decoded region in the source frame (for tiles), source px. */
+  offsetX?: number;
+  offsetY?: number;
   /** Source frame size, used to clip boxes. */
   imageWidth: number;
   imageHeight: number;
@@ -52,6 +55,8 @@ export interface DecodeOptions {
 export function decodeYolox(output: Float32Array, opts: DecodeOptions): Detection[] {
   const { inputSize, numClasses, ratio, imageWidth, imageHeight, scoreThreshold, classFilter } =
     opts;
+  const ox = opts.offsetX ?? 0;
+  const oy = opts.offsetY ?? 0;
   const stride = 5 + numClasses;
   const candidates: Detection[] = [];
   let row = 0;
@@ -80,10 +85,10 @@ export function decodeYolox(output: Float32Array, opts: DecodeOptions): Detectio
         const w = Math.exp(output[o + 2]) * s;
         const h = Math.exp(output[o + 3]) * s;
         candidates.push({
-          x1: clamp((cx - w / 2) / ratio, 0, imageWidth),
-          y1: clamp((cy - h / 2) / ratio, 0, imageHeight),
-          x2: clamp((cx + w / 2) / ratio, 0, imageWidth),
-          y2: clamp((cy + h / 2) / ratio, 0, imageHeight),
+          x1: clamp(ox + (cx - w / 2) / ratio, 0, imageWidth),
+          y1: clamp(oy + (cy - h / 2) / ratio, 0, imageHeight),
+          x2: clamp(ox + (cx + w / 2) / ratio, 0, imageWidth),
+          y2: clamp(oy + (cy + h / 2) / ratio, 0, imageHeight),
           score,
           classId: best,
         });

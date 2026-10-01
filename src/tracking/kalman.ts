@@ -1,3 +1,5 @@
+import { applyH, applyHLinear, localScaleH, type Homography } from '../vision/transforms';
+
 /**
  * One-dimensional constant-velocity Kalman filter (state: position, velocity).
  * A box is tracked with four independent instances (cx, cy, w, h); because the
@@ -51,6 +53,15 @@ export class Kalman1D {
     this.pvv = pvv;
   }
 
+  /** Rescales the state (units change, e.g. the camera zoomed by `k`). */
+  scaleBy(k: number): void {
+    this.p *= k;
+    this.v *= k;
+    this.ppp *= k * k;
+    this.ppv *= k * k;
+    this.pvv *= k * k;
+  }
+
   get positionStd(): number {
     return Math.sqrt(this.ppp);
   }
@@ -96,6 +107,21 @@ export class BoxKalman {
     // Never let the box collapse or invert.
     this.w.p = Math.max(this.w.p, 2);
     this.h.p = Math.max(this.h.p, 2);
+  }
+
+  /**
+   * Moves the state into the coordinates of a new frame after the camera moved
+   * (pan / tilt / zoom / roll). The velocity stays the object's own motion.
+   */
+  warp(H: Homography): void {
+    const [x, y] = applyH(H, this.cx.p, this.cy.p);
+    const [vx, vy] = applyHLinear(H, this.cx.p, this.cy.p, this.cx.v, this.cy.v);
+    const k = localScaleH(H, this.cx.p, this.cy.p);
+    for (const f of [this.cx, this.cy, this.w, this.h]) f.scaleBy(k);
+    this.cx.p = x;
+    this.cy.p = y;
+    this.cx.v = vx;
+    this.cy.v = vy;
   }
 
   update(box: Box): void {

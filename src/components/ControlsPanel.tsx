@@ -1,8 +1,17 @@
-import { CLASS_PRESETS, type ClassPreset } from '../detection/classes';
+import { AIRCRAFT_SIZES, CLASS_PRESETS, type AircraftSize, type ClassPreset } from '../detection/classes';
 import { MODELS, type ModelId } from '../detection/models';
+import { TILE_MODES, type TileMode } from '../detection/tiling';
 import type { DetectorStatus } from '../detection/types';
 import type { EngineMode, EngineStats } from '../engine/TrackingEngine';
 import type { Settings } from '../settings';
+
+const ZOOMS = [0.5, 1, 2, 3, 5, 10];
+
+const CAMERA_TEXT = {
+  static: 'Camera steady',
+  moving: 'Camera moving · compensated',
+  unknown: 'Camera motion unmeasurable (no background detail) · speeds may be off',
+} as const;
 
 interface Props {
   settings: Settings;
@@ -44,6 +53,12 @@ export function ControlsPanel(p: Props) {
         <div><b>{p.mode === 'live' ? p.stats.fps.toFixed(1) : '–'}</b><span>detections/s</span></div>
         <div><b>{p.stats.inferMs ? Math.round(p.stats.inferMs) : '–'}</b><span>ms / frame</span></div>
       </div>
+      {p.hasVideo && (
+        <p className={`camera-state ${p.stats.camera}`}>
+          {CAMERA_TEXT[p.stats.camera]}
+          {p.stats.passes > 1 && ` · ${p.stats.passes} detector passes / frame`}
+        </p>
+      )}
 
       <h3>Mode</h3>
       {p.mode === 'analyzing' ? (
@@ -87,6 +102,17 @@ export function ControlsPanel(p: Props) {
           ))}
         </select>
       </label>
+      <label
+        className="field"
+        title="Also runs the detector on zoomed-in tiles of the frame so that small, distant objects (cars in the background) are found. Slower."
+      >
+        <span>Small / distant objects</span>
+        <select value={s.tiling} onChange={(e) => set('tiling', e.target.value as TileMode)} disabled={p.mode === 'analyzing'}>
+          {(Object.keys(TILE_MODES) as TileMode[]).map((k) => (
+            <option key={k} value={k}>{TILE_MODES[k].label}</option>
+          ))}
+        </select>
+      </label>
       <label className="field">
         <span>Objects</span>
         <select value={s.preset} onChange={(e) => set('preset', e.target.value as ClassPreset)}>
@@ -101,6 +127,27 @@ export function ControlsPanel(p: Props) {
           type="range" min={0.2} max={0.8} step={0.05} value={s.confidence}
           onChange={(e) => set('confidence', Number(e.target.value))}
         />
+      </label>
+
+      <h3>Speed calibration</h3>
+      <label
+        className="field"
+        title="How far the camera was zoomed in. Phones: 1× is the main lens, 0.5× the ultra-wide. Needed to measure motion towards / away from the camera."
+      >
+        <span>Camera zoom</span>
+        <select value={s.zoom} onChange={(e) => set('zoom', Number(e.target.value))}>
+          {ZOOMS.map((z) => (
+            <option key={z} value={z}>{z}×{z === 1 ? ' (main lens, ~75°)' : z === 0.5 ? ' (ultra-wide)' : ''}</option>
+          ))}
+        </select>
+      </label>
+      <label className="field" title="Planes come in very different sizes; the speed scales with the size assumed.">
+        <span>Aircraft type</span>
+        <select value={s.aircraft} onChange={(e) => set('aircraft', e.target.value as AircraftSize)}>
+          {(Object.keys(AIRCRAFT_SIZES) as AircraftSize[]).map((k) => (
+            <option key={k} value={k}>{AIRCRAFT_SIZES[k].label}</option>
+          ))}
+        </select>
       </label>
 
       <h3>Display</h3>

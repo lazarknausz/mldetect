@@ -1,11 +1,8 @@
 import type { ModelSpec } from './models';
-import type { DetectParams, WorkerRequest, WorkerResponse } from './protocol';
-import type { Backend, Detection, DetectorStatus } from './types';
+import type { DetectParams, DetectResponse, WorkerRequest, WorkerResponse } from './protocol';
+import type { Backend, DetectorStatus } from './types';
 
-export interface DetectResult {
-  detections: Detection[];
-  inferMs: number;
-}
+export type DetectResult = DetectResponse;
 
 interface Pending {
   resolve: (r: DetectResult) => void;
@@ -82,7 +79,7 @@ export class DetectorClient {
       case 'result': {
         const p = this.pending.get(msg.id);
         this.pending.delete(msg.id);
-        p?.resolve({ detections: msg.detections, inferMs: msg.inferMs });
+        p?.resolve({ detections: msg.detections, inferMs: msg.inferMs, camera: msg.camera });
         break;
       }
       case 'error':

@@ -1,17 +1,33 @@
-import { CLASS_ID, MAX_PLAUSIBLE_KMH, REFERENCE_SIZE, className } from '../detection/classes';
+import { MAX_PLAUSIBLE_KMH, REFERENCE_SIZE, className, sameClassGroup, type ReferenceSize } from '../detection/classes';
 import { iou } from '../detection/postprocess';
 import type { Detection } from '../detection/types';
 import { assign } from './assignment';
 import { BoxKalman, type Box } from './kalman';
+import {
+  H_IDENTITY,
+  applyH,
+  applyHLinear,
+  composeH,
+  cornerMotion,
+  invertH,
+  rotationFromH,
+  scaleMotionH,
+  transposeMul,
+  type Homography,
+} from '../vision/transforms';
 import {
   MS_TO_KMH,
   compassLabel,
   estimateSpeed,
   estimateTurnRate,
   fitVelocity,
+  focalLengthPx,
   headingDegrees,
+  median,
+  zoomToDiagonalFov,
+  type SpeedEstimate,
 } from './motion';
-import type { HistoryPoint, TrackSnapshot, TrackState } from './types';
+import type { CameraState, HistoryPoint, TrackSnapshot, TrackState } from './types';
 
 export interface TrackerOptions {
   /** Detections at or above this score are "high confidence" (ByteTrack stage 1). */
@@ -28,6 +44,10 @@ export interface TrackerOptions {
   turnWindowSec: number;
   /** Length of the trail kept for drawing, seconds. */
   trailSec: number;
+  /** Camera zoom relative to a typical phone main lens (sets the assumed field of view). */
+  zoom: number;
+  /** Per-class size overrides (e.g. the kind of aircraft). */
+  referenceSizes: Partial<Record<number, ReferenceSize>>;
 }
 
 export const DEFAULT_TRACKER_OPTIONS: TrackerOptions = {
@@ -38,26 +58,21 @@ export const DEFAULT_TRACKER_OPTIONS: TrackerOptions = {
   velocityWindowSec: 0.6,
   turnWindowSec: 1.2,
   trailSec: 3,
+  zoom: 1,
+  referenceSizes: {},
 };
 
-/** Classes the detector often confuses with each other; matching across them is allowed. */
-const CLASS_GROUPS: number[][] = [
-  [CLASS_ID.car, CLASS_ID.truck, CLASS_ID.bus, CLASS_ID.train],
-  [CLASS_ID.bicycle, CLASS_ID.motorcycle],
-  [CLASS_ID.airplane, CLASS_ID.bird, CLASS_ID.kite],
-  [CLASS_ID.boat, CLASS_ID.surfboard],
-];
-const GROUP_OF = new Map<number, number>();
-CLASS_GROUPS.forEach((g, i) => g.forEach((c) => GROUP_OF.set(c, i)));
-
-function sameGroup(a: number, b: number): boolean {
-  if (a === b) return true;
-  const ga = GROUP_OF.get(a);
-  return ga !== undefined && ga === GROUP_OF.get(b);
-}
-
 const MAX_HISTORY = 400;
-const SPEED_SMOOTHING_SEC = 0.5;
+/** Raw speed estimates are median-filtered over this window (rejects outliers)… */
+const SPEED_MEDIAN_SEC = 1.0;
+/** …and then exponentially smoothed with this time constant. */
+const SPEED_SMOOTHING_SEC = 0.35;
+/** Track history needed before a speed is shown, seconds. */
+const MIN_SPEED_SPAN_SEC = 0.3;
+/** Camera motion is extrapolated over gaps in the background (e.g. blur) this long. */
+const MAX_CAMERA_GAP_SEC = 0.5;
+/** The full 3-D speed model is re-run at most this often per track (it is costly). */
+const SPEED_UPDATE_SEC = 0.1;
 const DUPLICATE_IOU = 0.6;
 const INFEASIBLE = Number.POSITIVE_INFINITY;
 
@@ -81,10 +96,14 @@ class Track {
   lastSeen: number;
   lastVelocity = { vx: 0, vy: 0 };
   measuring = true;
+  /** Recent raw speed estimates, km/h. */
+  speedSamples: Array<{ t: number; v: number }> = [];
   /** Exponentially smoothed speed for display, km/h. */
   speedEma: number | null = null;
   speedEmaT = 0;
   lastTurnRate = 0;
+  /** Latest 3-D speed model result and when it was computed. */
+  lastEstimate: { t: number; est: SpeedEstimate | null } | null = null;
 
   constructor(
     readonly id: number,
@@ -119,6 +138,11 @@ export class Tracker {
   private frameWidth = 1;
   private frameHeight = 1;
   private _totalConfirmed = 0;
+  /** Maps current-frame pixels to the scene-fixed reference frame (camera pose). */
+  private pose: Homography = H_IDENTITY;
+  /** Last measured camera motion (for extrapolation and screen velocity). */
+  private lastCamera: { transform: Homography; dt: number; t: number } | null = null;
+  private _cameraState: CameraState = 'static';
   opts: TrackerOptions;
 
   constructor(opts: Partial<TrackerOptions> = {}) {
@@ -134,24 +158,43 @@ export class Tracker {
     return this.lastT;
   }
 
+  /** Whether the camera is still, moving (compensated) or unmeasurable right now. */
+  get cameraState(): CameraState {
+    return this._cameraState;
+  }
+
   reset(): void {
     this.tracks = [];
     this.nextId = 1;
     this.lastT = null;
     this._totalConfirmed = 0;
+    this.pose = H_IDENTITY;
+    this.lastCamera = null;
+    this._cameraState = 'static';
   }
 
   /**
    * Advances all tracks to time `t` (seconds) and associates the new detections.
-   * Returns snapshots of all confirmed (and briefly lost) tracks.
+   * `camera` is the camera motion since the previous update (maps previous-frame
+   * pixels to this frame), `null` if it could not be measured, or omitted for a
+   * camera known to be static. Returns snapshots of all confirmed (and briefly
+   * lost) tracks.
    */
-  update(detections: Detection[], t: number, frameWidth: number, frameHeight: number): TrackSnapshot[] {
+  update(
+    detections: Detection[],
+    t: number,
+    frameWidth: number,
+    frameHeight: number,
+    camera?: Homography | null,
+  ): TrackSnapshot[] {
     const dt = this.lastT === null ? 0 : Math.max(0, t - this.lastT);
+    const first = this.lastT === null;
     this.lastT = t;
     this.frameWidth = frameWidth;
     this.frameHeight = frameHeight;
     const { highThreshold, lowThreshold } = this.opts;
 
+    if (!first) this.applyCameraMotion(camera, t, dt);
     for (const tr of this.tracks) tr.kf.predict(dt);
 
     const high = detections.filter((d) => d.score >= highThreshold);
@@ -215,13 +258,35 @@ export class Tracker {
     return this.snapshots(t);
   }
 
+  private applyCameraMotion(camera: Homography | null | undefined, t: number, dt: number): void {
+    let motion: Homography;
+    if (camera) {
+      motion = camera;
+      this.lastCamera = { transform: camera, dt, t };
+      const moved = cornerMotion(camera, this.frameWidth, this.frameHeight);
+      this._cameraState = moved > Math.max(1, 0.002 * this.frameWidth) ? 'moving' : 'static';
+    } else if (camera === null && this.lastCamera && t - this.lastCamera.t <= MAX_CAMERA_GAP_SEC && dt > 0) {
+      // Background briefly unmeasurable (motion blur, a featureless patch): assume the
+      // camera keeps moving as it just did.
+      motion = scaleMotionH(this.lastCamera.transform, dt / Math.max(1e-3, this.lastCamera.dt));
+      this._cameraState = 'moving';
+    } else {
+      motion = H_IDENTITY;
+      this._cameraState = camera === null ? 'unknown' : 'static';
+      if (camera === undefined) this.lastCamera = null;
+    }
+    if (motion === H_IDENTITY) return;
+    this.pose = composeH(this.pose, invertH(motion));
+    for (const tr of this.tracks) tr.kf.warp(motion);
+  }
+
   private confirm(tr: Track): void {
     if (tr.state === 'tentative') this._totalConfirmed++;
     tr.state = 'confirmed';
   }
 
   private cost(tr: Track, d: Detection, allowDistance: boolean): number {
-    if (!sameGroup(tr.classId, d.classId)) return INFEASIBLE;
+    if (!sameClassGroup(tr.classId, d.classId)) return INFEASIBLE;
     const classPenalty = tr.classId === d.classId ? 0 : 0.02;
     const pred = tr.kf.box;
     const overlap = iou(toDet(pred), d);
@@ -253,15 +318,64 @@ export class Tracker {
     else if (tr.state === 'tentative' && tr.hits >= this.opts.minHits) this.confirm(tr);
   }
 
+  /** Camera focal length in pixels (from the assumed zoom). */
+  private get focalPx(): number {
+    return focalLengthPx(this.frameWidth, this.frameHeight, zoomToDiagonalFov(this.opts.zoom));
+  }
+
+  /** Rotation from the current camera to the reference camera, or null if there is none. */
+  private poseRotation(): number[] | null {
+    if (this.pose === H_IDENTITY) return null;
+    return rotationFromH(this.pose, this.focalPx, this.frameWidth / 2, this.frameHeight / 2);
+  }
+
+  /**
+   * History positions are kept in the scene-fixed reference frame, so camera motion
+   * cancels out; the box itself is kept as seen, with the camera orientation it was
+   * seen from.
+   */
   private historyPoint(tr: Track, d: Detection, t: number, fw: number, fh: number): HistoryPoint {
     const margin = 2;
+    const b = toBox(d);
+    const [cx, cy] = applyH(this.pose, b.cx, b.cy);
+    const [sx, sy] = applyH(this.pose, tr.kf.cx.p, tr.kf.cy.p);
+    const rot = this.poseRotation();
     return {
       t,
-      ...toBox(d),
-      sx: tr.kf.cx.p,
-      sy: tr.kf.cy.p,
+      cx,
+      cy,
+      w: b.w,
+      h: b.h,
+      sx,
+      sy,
       clipped: d.x1 <= margin || d.y1 <= margin || d.x2 >= fw - margin || d.y2 >= fh - margin,
+      ...(rot ? { ix: b.cx, iy: b.cy, rot } : {}),
     };
+  }
+
+  /** The recent history seen through the current camera (current-frame pixels). */
+  private historyInView(tr: Track, t: number, maxAgeSec: number): HistoryPoint[] {
+    const toView = invertH(this.pose);
+    const now = this.poseRotation();
+    const out: HistoryPoint[] = [];
+    let i = tr.history.length - 1;
+    while (i > 0 && t - tr.history[i - 1].t <= maxAgeSec) i--;
+    for (; i < tr.history.length; i++) {
+      const p = tr.history[i];
+      const [cx, cy] = applyH(toView, p.cx, p.cy);
+      const [sx, sy] = applyH(toView, p.sx ?? p.cx, p.sy ?? p.cy);
+      const q: HistoryPoint = { t: p.t, cx, cy, w: p.w, h: p.h, sx, sy, clipped: p.clipped };
+      if (p.rot || now) {
+        // Seen from another camera orientation: keep where it was in that frame and
+        // the rotation from that camera to the current one.
+        const id = [1, 0, 0, 0, 1, 0, 0, 0, 1];
+        q.ix = p.ix ?? p.cx;
+        q.iy = p.iy ?? p.cy;
+        q.rot = transposeMul(now ?? id, p.rot ?? id);
+      }
+      out.push(q);
+    }
+    return out;
   }
 
   private snapshots(t: number): TrackSnapshot[] {
@@ -276,11 +390,22 @@ export class Tracker {
   private snapshot(tr: Track, t: number): TrackSnapshot {
     const { velocityWindowSec, turnWindowSec, trailSec } = this.opts;
     const b = tr.kf.box;
+    const fullHistory = this.historyInView(tr, t, Math.max(trailSec, 2.5 * Math.max(velocityWindowSec, 2, turnWindowSec)));
+    // A box cut off by the frame edge moves and grows as the object slides into view,
+    // which is not the object's motion: measure from whole boxes when there are enough.
+    const whole = fullHistory.filter((p) => !p.clipped && t - p.t <= 2.5 * velocityWindowSec);
+    const partial = whole.length < 4;
+    const history = partial ? fullHistory : fullHistory.filter((p) => !p.clipped);
     if (tr.state !== 'lost') {
-      const fit = fitVelocity(tr.history, velocityWindowSec);
+      const fit = fitVelocity(history, velocityWindowSec);
       tr.lastVelocity = fit ?? { vx: tr.kf.cx.v, vy: tr.kf.cy.v };
-      tr.measuring = fit === null;
-      tr.lastTurnRate = 0.5 * tr.lastTurnRate + 0.5 * estimateTurnRate(tr.history, turnWindowSec);
+      const span = history.length ? history[history.length - 1].t - history[0].t : 0;
+      tr.measuring = fit === null || history.length < 4 || span < MIN_SPEED_SPAN_SEC || (partial && tr.speedEma === null);
+      tr.lastTurnRate = 0.5 * tr.lastTurnRate + 0.5 * estimateTurnRate(history, turnWindowSec);
+    } else if (this.lastCamera && this._cameraState === 'moving') {
+      // Keep the coasting velocity in the current camera's orientation.
+      const [vx, vy] = applyHLinear(this.lastCamera.transform, b.cx, b.cy, tr.lastVelocity.vx, tr.lastVelocity.vy);
+      tr.lastVelocity = { vx, vy };
     }
     const { vx, vy } = tr.lastVelocity;
     const speedPx = Math.hypot(vx, vy);
@@ -289,20 +414,31 @@ export class Tracker {
     let speedKmh: number | null = null;
     let approach: TrackSnapshot['approach'] = null;
     let depthMoving = false;
-    const ref = REFERENCE_SIZE[tr.classId];
+    /** Showing the previous reading instead of a new measurement. */
+    let holding = partial;
+    const ref = this.opts.referenceSizes[tr.classId] ?? REFERENCE_SIZE[tr.classId];
     if (ref && !measuring) {
-      const est = estimateSpeed({
-        history: tr.history,
-        vx,
-        vy,
-        cx: b.cx,
-        cy: b.cy,
-        frameWidth: this.frameWidth,
-        frameHeight: this.frameHeight,
-        ref,
-        windowSec: velocityWindowSec,
-      });
-      if (est) {
+      // Only partly in view: hold the last reading rather than measure the cut-off box.
+      const stale = !tr.lastEstimate || t - tr.lastEstimate.t >= SPEED_UPDATE_SEC - 1e-6 || t < tr.lastEstimate.t;
+      if (stale && !partial) {
+        const fresh = estimateSpeed({
+          history,
+          frameWidth: this.frameWidth,
+          frameHeight: this.frameHeight,
+          ref,
+          windowSec: velocityWindowSec,
+          focalPx: this.focalPx,
+        });
+        tr.lastEstimate = { t, est: fresh };
+      }
+      const est = tr.lastEstimate?.est ?? null;
+      if (est && !est.settled) {
+        // Undecided whether it moves towards / away from the camera: keep showing the
+        // last reading, or "measuring" if there is none yet.
+        if (tr.speedEma === null) measuring = true;
+        else speedKmh = tr.speedEma;
+        holding = true;
+      } else if (est) {
         speedKmh = est.metresPerSecond * MS_TO_KMH;
         if (est.depthComponent <= -0.5) approach = 'approaching';
         else if (est.depthComponent >= 0.5) approach = 'receding';
@@ -315,28 +451,43 @@ export class Tracker {
       }
     }
     // Head-on objects barely move on screen but still loom, so they are not stationary.
-    const stationary = !measuring && !depthMoving && speedPx < Math.max(4, 0.15 * size);
+    let stationary = !measuring && !holding && !depthMoving && speedPx < Math.max(4, 0.15 * size);
     if (stationary) {
       if (speedKmh !== null) speedKmh = 0;
       approach = null;
     }
-    if (speedKmh !== null && tr.state !== 'lost') {
-      // Time-based EMA (τ = 0.5 s) so the readout is steady at any frame rate.
+    if (speedKmh !== null && tr.state !== 'lost' && tr.speedEmaT !== t && !holding) {
+      // A median over the last second rejects one-off glitches (a bad box, a
+      // mis-measured camera move); the EMA then steadies the readout.
+      tr.speedSamples.push({ t, v: speedKmh });
+      while (tr.speedSamples.length && t - tr.speedSamples[0].t > SPEED_MEDIAN_SEC) tr.speedSamples.shift();
+      const filtered = median(tr.speedSamples.map((p) => p.v));
       const alpha = tr.speedEma === null ? 1 : 1 - Math.exp(-Math.max(0, t - tr.speedEmaT) / SPEED_SMOOTHING_SEC);
-      tr.speedEma = tr.speedEma === null ? speedKmh : tr.speedEma + alpha * (speedKmh - tr.speedEma);
+      tr.speedEma = tr.speedEma === null ? filtered : tr.speedEma + alpha * (filtered - tr.speedEma);
       tr.speedEmaT = t;
       speedKmh = tr.speedEma;
     } else if (speedKmh !== null) {
       speedKmh = tr.speedEma ?? speedKmh;
     }
+    // A reading that rounds to nothing is "stationary" (no meaningful heading).
+    if (!holding && speedKmh !== null && speedKmh < 1) stationary = true;
+    if (stationary && speedKmh !== null) speedKmh = 0;
+    if (speedKmh !== null && speedKmh < 3) approach = null;
     const headingDeg = stationary || measuring ? null : headingDegrees(vx, vy);
 
-    const trail: TrackSnapshot['trail'] = [];
-    for (let i = tr.history.length - 1; i >= 0 && t - tr.history[i].t <= trailSec; i--) {
-      const p = tr.history[i];
-      trail.push({ t: p.t, x: p.sx ?? p.cx, y: p.sy ?? p.cy });
+    // On-screen motion = own motion + the camera's (for drawing between detections).
+    let screenVx = vx;
+    let screenVy = vy;
+    if (this.lastCamera && this._cameraState === 'moving' && this.lastCamera.dt > 0) {
+      const [mx, my] = applyH(this.lastCamera.transform, b.cx, b.cy);
+      screenVx += (mx - b.cx) / this.lastCamera.dt;
+      screenVy += (my - b.cy) / this.lastCamera.dt;
     }
-    trail.reverse();
+
+    const trail: TrackSnapshot['trail'] = [];
+    for (const p of fullHistory) {
+      if (t - p.t <= trailSec) trail.push({ t: p.t, x: p.sx ?? p.cx, y: p.sy ?? p.cy });
+    }
 
     return {
       id: tr.id,
@@ -352,6 +503,8 @@ export class Tracker {
       h: b.h,
       vx,
       vy,
+      screenVx,
+      screenVy,
       vw: tr.kf.w.v,
       vh: tr.kf.h.v,
       speedPx,
@@ -366,3 +519,4 @@ export class Tracker {
     };
   }
 }
+

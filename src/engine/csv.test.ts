@@ -6,7 +6,7 @@ describe('framesToCsv', () => {
   it('writes a header and one row per track per frame', () => {
     const s = {
       id: 3, classId: 2, label: 'car', score: 0.9, state: 'confirmed', t: 1, firstSeen: 0,
-      cx: 10, cy: 20, w: 30, h: 15, vx: 100, vy: 0, vw: 0, vh: 0, speedPx: 100, speedKmh: 54.04,
+      cx: 10, cy: 20, w: 30, h: 15, vx: 100, vy: 0, screenVx: 100, screenVy: 0, vw: 0, vh: 0, speedPx: 100, speedKmh: 54.04,
       headingDeg: 90, compass: 'E', stationary: false, measuring: false, approach: null, turnRate: 0, trail: [],
     } satisfies TrackSnapshot;
     const csv = framesToCsv([{ t: 1, tracks: [s] }, { t: 1.1, tracks: [] }]).trim().split('\n');

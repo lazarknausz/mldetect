@@ -1,11 +1,18 @@
-import type { ClassPreset } from './detection/classes';
+import type { AircraftSize, ClassPreset } from './detection/classes';
 import type { ModelId } from './detection/models';
+import type { TileMode } from './detection/tiling';
 
 export interface Settings {
   model: ModelId;
   preset: ClassPreset;
+  /** Extra detector passes on zoomed-in tiles, for small / distant objects. */
+  tiling: TileMode;
   /** Minimum detector confidence for starting a track (ByteTrack high threshold). */
   confidence: number;
+  /** Camera zoom relative to a phone's main lens (sets the field of view for speeds). */
+  zoom: number;
+  /** What kind of aircraft "airplane" detections are (sets their size for speeds). */
+  aircraft: AircraftSize;
   showTrails: boolean;
   showPredictions: boolean;
   showLabels: boolean;
@@ -19,7 +26,10 @@ export interface Settings {
 export const DEFAULT_SETTINGS: Settings = {
   model: 'tiny',
   preset: 'moving',
-  confidence: 0.4,
+  tiling: 'standard',
+  confidence: 0.35,
+  zoom: 1,
+  aircraft: 'narrowbody',
   showTrails: true,
   showPredictions: true,
   showLabels: true,
