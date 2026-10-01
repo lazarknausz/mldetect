@@ -59,7 +59,11 @@ Speeds are **estimates** (typically within ±20–30% for a static camera):
 
 ## Deploying
 
-`.github/workflows/deploy.yml` builds and publishes the site to **GitHub Pages** on every push to `main`. Enable it once under *Settings → Pages → Source: GitHub Actions*. The site is fully static, so any static host works: serve `dist/`, ideally with these headers to enable multi-threaded WASM:
+The site is published to **GitHub Pages** at <https://lazarknausz.github.io/mldetect/> from the `gh-pages` branch. `.github/workflows/deploy.yml` rebuilds and republishes it on every push to `main`.
+
+One-time setup: *Settings → Pages → Build and deployment → Source: "Deploy from a branch"*, branch **gh-pages**, folder **/ (root)**. On a free GitHub plan, Pages only works for **public** repositories.
+
+The site is fully static, so any static host works: serve `dist/`, ideally with these headers to enable multi-threaded WASM:
 
 ```
 Cross-Origin-Opener-Policy: same-origin
