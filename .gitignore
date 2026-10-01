@@ -6,3 +6,4 @@ test-results
 playwright-report
 .DS_Store
 public/ort
+src/**/*.local.test.ts

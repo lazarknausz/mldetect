@@ -1,11 +1,12 @@
 import type { ModelSpec } from './models';
-import type { DetectParams, DetectResponse, WorkerRequest, WorkerResponse } from './protocol';
+import type { DetectParams, DetectResponse, GunParams, GunResponse, WorkerRequest, WorkerResponse } from './protocol';
 import type { Backend, DetectorStatus } from './types';
 
 export type DetectResult = DetectResponse;
 
 interface Pending {
-  resolve: (r: DetectResult) => void;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  resolve: (r: any) => void;
   reject: (e: Error) => void;
 }
 
@@ -45,6 +46,15 @@ export class DetectorClient {
     });
   }
 
+  /** Speed-gun step: optional detection, camera motion and optical-flow target tracking. */
+  gunStep(bitmap: ImageBitmap, params: GunParams): Promise<GunResponse> {
+    const id = this.nextId++;
+    return new Promise((resolve, reject) => {
+      this.pending.set(id, { resolve, reject });
+      this.post({ type: 'gun', id, bitmap, ...params }, [bitmap]);
+    });
+  }
+
   terminate(): void {
     this.worker.terminate();
     for (const p of this.pending.values()) p.reject(new Error('Detector terminated'));
@@ -80,6 +90,13 @@ export class DetectorClient {
         const p = this.pending.get(msg.id);
         this.pending.delete(msg.id);
         p?.resolve({ detections: msg.detections, inferMs: msg.inferMs, camera: msg.camera });
+        break;
+      }
+      case 'gunResult': {
+        const p = this.pending.get(msg.id);
+        this.pending.delete(msg.id);
+        const { type: _t, id: _i, ...res } = msg;
+        p?.resolve(res);
         break;
       }
       case 'error':

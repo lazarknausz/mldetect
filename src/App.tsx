@@ -115,6 +115,9 @@ export default function App() {
           <h1>MLDetect</h1>
         </div>
         <p>Track every car, plane, boat or bird in a video: speed, direction and where it is heading next.</p>
+        <a className="nav-link" href="speed-gun.html">
+          Speed gun (calibrated) →
+        </a>
       </header>
 
       {error && (

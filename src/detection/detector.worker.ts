@@ -1,11 +1,20 @@
 /// <reference lib="webworker" />
 import * as ort from 'onnxruntime-web/webgpu';
 import { buildPyramid, estimateGlobalMotion, rgbaToGray, type GrayImage } from '../vision/globalMotion';
-import { rescaleH } from '../vision/transforms';
+import { measureFrameMotion } from '../vision/regionTracker';
+import { rescaleH, type Homography } from '../vision/transforms';
 import { NUM_CLASSES } from './classes';
 import { decodeYolox } from './postprocess';
 import { PAD_VALUE, rgbaToBgrChw } from './preprocess';
-import { MOTION_IMAGE_SIZE, type DetectResponse, type WorkerRequest, type WorkerResponse } from './protocol';
+import {
+  GUN_MOTION_IMAGE_SIZE,
+  MOTION_IMAGE_SIZE,
+  type DetectResponse,
+  type GunResponse,
+  type WorkerRequest,
+  type WorkerResponse,
+} from './protocol';
+import type { Region } from './tiling';
 import { dropCutAtTileEdge, mergeRegionDetections, regionRatio } from './tiling';
 import type { Backend, Detection } from './types';
 
@@ -135,7 +144,17 @@ async function init(modelUrl: string, size: number, preferWebGPU: boolean) {
   post({ type: 'ready', backend: 'wasm' });
 }
 
-async function detectRegions(msg: Extract<WorkerRequest, { type: 'detect' }>): Promise<Detection[]> {
+interface RegionJob {
+  bitmap: ImageBitmap;
+  bitmapScale: number;
+  imageWidth: number;
+  imageHeight: number;
+  regions: Region[];
+  scoreThreshold: number;
+  classes: number[] | null;
+}
+
+async function detectRegions(msg: RegionJob): Promise<Detection[]> {
   const bs = msg.bitmapScale;
   let full: Detection[] = [];
   const tiles: Detection[] = [];
@@ -204,6 +223,79 @@ async function detect(msg: Extract<WorkerRequest, { type: 'detect' }>) {
   }
 }
 
+// ------------------------------------------------------------------ speed gun
+
+let gunCtx: OffscreenCanvasRenderingContext2D | null = null;
+let gunPrev: { sequence: number; t: number; pyramid: GrayImage[]; scale: number; boxes: Detection[] } | null = null;
+
+/**
+ * One speed-gun frame: (optionally) detect vehicles, measure how the camera moved, and
+ * follow each target's own texture with optical flow — all against the previous frame.
+ */
+async function gunStep(msg: Extract<WorkerRequest, { type: 'gun' }>) {
+  const t0 = performance.now();
+  try {
+    const detections = msg.detect && session ? await detectRegions({ ...msg, ...msg.detect }) : [];
+    const scale = Math.min(msg.bitmapScale, GUN_MOTION_IMAGE_SIZE / Math.max(msg.imageWidth, msg.imageHeight));
+    const gw = Math.max(1, Math.round(msg.imageWidth * scale));
+    const gh = Math.max(1, Math.round(msg.imageHeight * scale));
+    if (!gunCtx || gunCtx.canvas.width !== gw || gunCtx.canvas.height !== gh) {
+      gunCtx = new OffscreenCanvas(gw, gh).getContext('2d', { willReadFrequently: true })!;
+    }
+    gunCtx.drawImage(msg.bitmap, 0, 0, gw, gh);
+    const pyramid = buildPyramid(rgbaToGray(gunCtx.getImageData(0, 0, gw, gh).data, gw, gh), 5);
+    const prev = gunPrev;
+    const toGray = (b: { x1: number; y1: number; x2: number; y2: number }) => ({
+      x1: b.x1 * scale,
+      y1: b.y1 * scale,
+      x2: b.x2 * scale,
+      y2: b.y2 * scale,
+    });
+    gunPrev = {
+      sequence: msg.sequence,
+      t: msg.t,
+      pyramid,
+      scale,
+      boxes: [...detections, ...msg.targets.map((tg) => ({ ...tg.box, score: 1, classId: -1 }))],
+    };
+    const dt = prev ? msg.t - prev.t : 0;
+    const comparable = prev && prev.sequence === msg.sequence && prev.scale === scale && dt > 0 && dt <= MAX_MOTION_GAP_SEC;
+    let camera: Homography | null | undefined;
+    let targets: GunResponse['targets'];
+    if (comparable) {
+      const r = measureFrameMotion(
+        prev.pyramid,
+        pyramid,
+        msg.targets.map((tg) => ({
+          id: tg.id,
+          box: toGray(tg.box),
+          guess: { x: tg.guess.x * scale, y: tg.guess.y * scale },
+          ...(tg.line
+            ? { line: { a: { x: tg.line.a.x * scale, y: tg.line.a.y * scale }, b: { x: tg.line.b.x * scale, y: tg.line.b.y * scale } } }
+            : {}),
+        })),
+        prev.boxes.map(toGray),
+      );
+      camera = r.camera ? rescaleH(r.camera, 1 / scale) : null;
+      // Grey-image px → source px: only the shift changes with the scale.
+      targets = r.targets.map((x) => ({
+        id: x.id,
+        motion: x.motion ? { ...x.motion.transform, tx: x.motion.transform.tx / scale, ty: x.motion.transform.ty / scale } : null,
+        affine: x.motion?.affine ? { ...x.motion.affine, tx: x.motion.affine.tx / scale, ty: x.motion.affine.ty / scale } : null,
+        lineAffine: x.lineMotion?.affine
+          ? { ...x.lineMotion.affine, tx: x.lineMotion.affine.tx / scale, ty: x.lineMotion.affine.ty / scale }
+          : null,
+        inliers: x.motion?.inliers ?? 0,
+      }));
+    } else {
+      targets = msg.targets.map((tg) => ({ id: tg.id, motion: null, affine: null, lineAffine: null, inliers: 0 }));
+    }
+    post({ type: 'gunResult', id: msg.id, detections, camera, targets, ms: performance.now() - t0 });
+  } finally {
+    msg.bitmap.close();
+  }
+}
+
 self.onmessage = (e: MessageEvent<WorkerRequest>) => {
   const msg = e.data;
   if (msg.type === 'init') {
@@ -212,5 +304,7 @@ self.onmessage = (e: MessageEvent<WorkerRequest>) => {
     );
   } else if (msg.type === 'detect') {
     detect(msg).catch((err) => post({ type: 'error', id: msg.id, message: String(err?.message ?? err) }));
+  } else if (msg.type === 'gun') {
+    gunStep(msg).catch((err) => post({ type: 'error', id: msg.id, message: String(err?.message ?? err) }));
   }
 };
