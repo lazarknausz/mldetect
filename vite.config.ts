@@ -41,6 +41,12 @@ export default defineConfig({
   // Set BASE_PATH=/mldetect/ when deploying to GitHub Pages.
   base: process.env.BASE_PATH ?? '/',
   plugins: [react(), onnxRuntimeFiles()],
+  build: {
+    rollupOptions: {
+      // Two pages: the object tracker and the calibrated speed gun.
+      input: { main: resolve(root, 'index.html'), speedGun: resolve(root, 'speed-gun.html') },
+    },
+  },
   resolve: {
     alias: { 'onnxruntime-web/webgpu': resolve(ortDist, 'ort.webgpu.min.mjs') },
   },

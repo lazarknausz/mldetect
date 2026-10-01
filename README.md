@@ -64,6 +64,27 @@ In simulated 3-D scenes with detector-like box jitter (`src/tracking/simulation.
 - Motion mostly towards or away from the camera needs 1–2 s of track history to settle.
 - Objects partly outside the frame keep their last reading until they are fully visible.
 
+## Speed gun (calibrated)
+
+`speed-gun.html` (linked from the main page) measures speed the way a LIDAR speed gun does, **distance over time**, from a calibration line you draw on the video:
+
+1. **Load** an .mp4 / .webm. The frame rate is detected automatically (it can be edited).
+2. **Calibrate:** drag a line over something of known length and type the length (presets: US lane-marking cycle 12.19 m, car 4.5 m, Boeing 737-800 39.5 m, …). This gives *metres per pixel*.
+3. **Measure:** the gun steps through **every frame**. Time between frames is exactly 1 / FPS. Distance is the vehicle's pixel displacement × metres per pixel. Speed = distance / time, shown on the box, as *Current speed* and as *Max speed detected*.
+
+Two kinds of calibration, because one metres-per-pixel ratio is only true at one distance from the camera:
+
+| Mode | Line drawn on | How it measures | Best for |
+| --- | --- | --- | --- |
+| **Road** (speed trap) | lane markings, along the road | Each vehicle's ground point (bottom of its box) is timed across the line's stretch: **line length ÷ crossing time**. The image row of a road point depends only on its distance down the road, so one lane's markings calibrate every lane. | fixed cameras over a road |
+| **Vehicle** | the vehicle itself, nose to tail | The line is carried along on the vehicle frame by frame, so the scale follows it as it comes closer, turns or the camera zooms. Displacement is measured against the background, so a panning camera is compensated. | aircraft, a followed car |
+
+Precision comes from: sub-pixel Lucas–Kanade optical flow on the vehicle's own texture (not jittery detector boxes); camera motion measured from the background with RANSAC; and least-squares fits over many frames instead of single-frame differences.
+
+**Validation on real footage** (`4K Video of Highway Traffic`, overpass camera, road mode, calibrated on one 12.19 m lane-marking cycle): over the first 10 s, 21 cars were also timed by an independent method (raw per-frame detector boxes crossing the same two rows, no optical flow). Median difference **1.3 %**, mean +0.9 %, worst 6 %. Simulated 3-D scenes (perspective highway, panning and zooming camera following an airliner) are in `src/speedgun/meter.test.ts` and land within 1.5–2 %.
+
+**Limits:** one camera only sees motion across the picture. A vehicle driving straight at the camera barely moves on screen, so its speed can't be measured then (like a radar gun's cosine error, the other way round). The vehicle-mode reading is held while the vehicle is partly out of the frame. Accuracy is only as good as the calibration line: a 2 px error on a 100 px line is 2 % in speed.
+
 ## Deploying
 
 The site is published to **GitHub Pages** at <https://lazarknausz.github.io/mldetect/> from the `gh-pages` branch. `.github/workflows/deploy.yml` rebuilds and republishes it on every push to `main`.
@@ -83,11 +104,13 @@ Without them (e.g. on GitHub Pages) it still works: WebGPU is unaffected and the
 
 ```
 src/detection/   model registry, worker, pre/post-processing (decode, NMS), tiling, class sizes
-src/vision/      camera motion: optical flow, RANSAC, homographies
+src/vision/      camera motion (optical flow, RANSAC, homographies), region tracker
 src/tracking/    Kalman filter, Hungarian assignment, ByteTrack tracker, motion & speed
 src/engine/      TrackingEngine (video ↔ worker ↔ tracker ↔ overlay), CSV export
 src/render/      canvas overlay
 src/components/  React UI
+src/speedgun/    speed gun page: speedMath (formulas), meter (trap / vehicle logic),
+                 analysisLoop (frame stepping), calibration, canvasView, fileHandling, main
 ```
 
 ## License
